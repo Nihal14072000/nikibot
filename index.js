@@ -12,6 +12,19 @@ import {
   likelyNeedsSearch,
 } from "./tools/search.js";
 import { runCommand, formatResult, inferCommand } from "./tools/cli.js";
+import {
+  readMemory, appendMemory, forgetMemory, replaceMemory,
+  detectMemoryIntent, extractFact, autoExtractAndSave,
+  buildMemoryContext, initMemory, memoryExists,
+} from "./tools/memory.js";
+import {
+  listEmails, readEmail, sendEmail, replyToEmail,
+  modifyEmail, getUnreadCount, formatEmailList, formatEmailDetail,
+  GMAIL_SCOPES,
+} from "./tools/gmail.js";
+import { google } from "googleapis";
+import fs from "fs";
+import path from "path";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -180,6 +193,7 @@ ${contextText}`,
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 console.log(`🤖  Bot started | provider=${PROVIDER} | model=${model}`);
+initMemory(); // create MEMORY.md if it doesn't exist
 console.log(`🔍  Web search: ${AUTO_SEARCH ? "AUTO (Brave)" : process.env.BRAVE_API_KEY ? "manual only (/search)" : "disabled (no BRAVE_API_KEY)"}`);
 if (ALLOWED) console.log(`🔒  Restricted to user IDs: ${[...ALLOWED].join(", ")}`);
 
@@ -293,6 +307,382 @@ bot.on("message", (msg) => {
     return;
   }
 
+
+  // ── /memory — show current memory ───────────────────────────
+  if (text === "/memory") {
+    const mem = readMemory();
+    if (!mem) {
+      bot.sendMessage(chatId, "🧠 Memory is empty. Say "remember that..." to save something.");
+    } else {
+      // Split into chunks if too long for one Telegram message
+      const chunks = splitMessage(mem, 4000);
+      for (const chunk of chunks) {
+        await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+      }
+    }
+    return;
+  }
+
+  // ── /remember <fact> — explicitly store a fact ────────────
+  if (text.startsWith("/remember ")) {
+    const fact = text.slice(10).trim();
+    if (!fact) { bot.sendMessage(chatId, "Usage: /remember <fact>\nExample: /remember I am a backend developer"); return; }
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      const { fact: clean, section } = await extractFact(fact, (h) => chat(h));
+      const line = appendMemory(clean, section);
+      await bot.sendMessage(chatId, `🧠 Saved to memory under *${section}*:\n${line}`, { parse_mode: "Markdown" });
+    });
+    return;
+  }
+
+  // ── /forget <query> — remove matching lines ───────────────
+  if (text.startsWith("/forget ")) {
+    const query = text.slice(8).trim();
+    if (!query) { bot.sendMessage(chatId, "Usage: /forget <what to forget>\nExample: /forget dark mode"); return; }
+    const removed = forgetMemory(query);
+    if (removed) {
+      await bot.sendMessage(chatId, `🗑️ Removed entries matching "*${query}*" from memory.`, { parse_mode: "Markdown" });
+    } else {
+      await bot.sendMessage(chatId, `Nothing in memory matched "*${query}*".`, { parse_mode: "Markdown" });
+    }
+    return;
+  }
+
+  // ── /memoryclear — wipe entire memory ────────────────────
+  if (text === "/memoryclear") {
+    replaceMemory("");
+    await bot.sendMessage(chatId, "🗑️ Memory cleared.");
+    return;
+  }
+
+  // ── /gmailauth — start Telegram-based OAuth flow ─────────
+  if (text === "/gmailauth") {
+    enqueue(async () => {
+      try {
+        const CREDS_PATH = path.resolve(process.env.GMAIL_CREDS_PATH || "gmail-credentials.json");
+        const TOKEN_PATH = path.resolve(process.env.GMAIL_TOKEN_PATH || "gmail-token.json");
+
+        if (!fs.existsSync(CREDS_PATH)) {
+          await bot.sendMessage(chatId,
+            "gmail-credentials.json not found on the server.\n\n" +
+            "1. Create OAuth credentials in Google Cloud Console (Desktop app type)\n" +
+            "2. Download the JSON file\n" +
+            "3. Upload it to your bot folder:\n" +
+            "   scp gmail-credentials.json ubuntu@<vm-ip>:~/telegram-ai-bot/\n\n" +
+            "Then send /gmailauth again.\nFull guide: docs/GMAIL.md"
+          );
+          return;
+        }
+
+        if (fs.existsSync(TOKEN_PATH)) {
+          await bot.sendMessage(chatId, "Gmail is already connected. Send /gmailauth_reset to reconnect with a different account.");
+          return;
+        }
+
+        const creds = JSON.parse(fs.readFileSync(CREDS_PATH, "utf8"));
+        const { client_id, client_secret } = creds.installed || creds.web;
+        const auth = new google.auth.OAuth2(
+          client_id, client_secret,
+          "urn:ietf:wg:oauth:2.0:oob"
+        );
+
+        const authUrl = auth.generateAuthUrl({
+          access_type: "offline",
+          scope: GMAIL_SCOPES,
+          prompt: "consent",
+        });
+
+        // Store auth client for when user pastes code
+        gmailAuthSessions.set(String(chatId), { auth, TOKEN_PATH });
+
+        await bot.sendMessage(chatId,
+          "Connect Gmail in 3 steps:\n\n" +
+          "1. Open this URL in your browser (phone works too):\n" +
+          authUrl + "\n\n" +
+          "2. Sign in with your Gmail and approve access\n\n" +
+          "3. You will see a code on screen (or in the URL bar after ?code=)\n\n" +
+          "Paste the code here as: /gmailcode YOUR_CODE_HERE"
+        );
+      } catch (err) {
+        await bot.sendMessage(chatId, "Gmail auth error: " + err.message);
+      }
+    });
+    return;
+  }
+
+  // /gmailauth_reset — force re-authorisation
+  if (text === "/gmailauth_reset") {
+    const TOKEN_PATH = path.resolve(process.env.GMAIL_TOKEN_PATH || "gmail-token.json");
+    if (fs.existsSync(TOKEN_PATH)) {
+      fs.unlinkSync(TOKEN_PATH);
+      await bot.sendMessage(chatId, "Token cleared. Send /gmailauth to reconnect.");
+    } else {
+      await bot.sendMessage(chatId, "No token found. Send /gmailauth to connect.");
+    }
+    return;
+  }
+
+  // /gmailcode <code> — complete OAuth flow
+  if (text.startsWith("/gmailcode ")) {
+    const code    = text.slice(11).trim();
+    const session = gmailAuthSessions.get(String(chatId));
+
+    if (!session) {
+      await bot.sendMessage(chatId, "No pending auth session. Send /gmailauth first.");
+      return;
+    }
+
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        const { auth, TOKEN_PATH } = session;
+
+        // Accept raw code or full redirect URL
+        let finalCode = code;
+        if (code.includes("code=")) {
+          try {
+            finalCode = new URL(code).searchParams.get("code") || code;
+          } catch {
+            finalCode = code.split("code=")[1]?.split("&")[0] || code;
+          }
+        }
+
+        const { tokens } = await auth.getToken(finalCode);
+        auth.setCredentials(tokens);
+        fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+
+        // Verify connection
+        const gmail   = google.gmail({ version: "v1", auth });
+        const profile = await gmail.users.getProfile({ userId: "me" });
+
+        gmailAuthSessions.delete(String(chatId));
+
+        await bot.sendMessage(chatId,
+          "Gmail connected successfully!\n" +
+          "Account: " + profile.data.emailAddress + "\n\n" +
+          "Try it: /inbox"
+        );
+      } catch (err) {
+        await bot.sendMessage(chatId,
+          "Code rejected: " + err.message + "\n\n" +
+          "The code may have expired (they last ~10 minutes).\n" +
+          "Send /gmailauth to get a fresh link."
+        );
+      }
+    });
+    return;
+  }
+
+  // ── Gmail commands ────────────────────────────────────────
+
+  // /inbox — show recent unread emails
+  if (text === "/inbox" || text.startsWith("/inbox ")) {
+    const query = text.includes(" ") ? text.slice(7).trim() : "is:unread in:inbox";
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        const emails = await listEmails(query);
+        const count  = await getUnreadCount();
+        const header = `📬 *Inbox* (${count} unread)\n\n`;
+        const list   = formatEmailList(emails);
+        await bot.sendMessage(chatId, header + list, { parse_mode: "Markdown" });
+        if (emails.length) {
+          await bot.sendMessage(chatId, `_Reply with /read <number> to open an email_`, { parse_mode: "Markdown" });
+          // Cache email IDs for this chat session
+          emailCache.set(String(chatId), emails);
+        }
+      } catch (err) {
+        await bot.sendMessage(chatId, gmailError(err));
+      }
+    });
+    return;
+  }
+
+  // /read <number|id> — read a full email
+  if (text.startsWith("/read ")) {
+    const arg = text.slice(6).trim();
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        const messageId = resolveEmailId(chatId, arg);
+        if (!messageId) {
+          await bot.sendMessage(chatId, "⚠️ Use /inbox first, then /read <number> (e.g. /read 2)");
+          return;
+        }
+        const email = await readEmail(messageId);
+        const detail = formatEmailDetail(email);
+        await bot.sendMessage(chatId, detail, { parse_mode: "Markdown" });
+        await bot.sendMessage(
+          chatId,
+          `_Actions: /reply ${arg} <text>  |  /archive ${arg}  |  /trash ${arg}  |  /star ${arg}_`,
+          { parse_mode: "Markdown" }
+        );
+        // Cache last-read for reply
+        lastRead.set(String(chatId), { messageId, email });
+      } catch (err) {
+        await bot.sendMessage(chatId, gmailError(err));
+      }
+    });
+    return;
+  }
+
+  // /reply <number|id> <message> — reply to an email
+  if (text.startsWith("/reply ")) {
+    const parts   = text.slice(7).trim().split(" ");
+    const arg     = parts[0];
+    const replyText = parts.slice(1).join(" ").trim();
+
+    if (!replyText) {
+      bot.sendMessage(chatId, "Usage: /reply <number> <your reply text>\nExample: /reply 1 Thanks, I\'ll get back to you tomorrow.");
+      return;
+    }
+
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        const messageId = resolveEmailId(chatId, arg);
+        if (!messageId) {
+          await bot.sendMessage(chatId, "⚠️ Use /inbox first, then /reply <number> <text>");
+          return;
+        }
+        await replyToEmail(messageId, replyText);
+        await bot.sendMessage(chatId, "✅ Reply sent!");
+      } catch (err) {
+        await bot.sendMessage(chatId, gmailError(err));
+      }
+    });
+    return;
+  }
+
+  // /send — send a new email
+  // Usage: /send to@email.com | Subject line | Body text
+  if (text.startsWith("/send ")) {
+    const parts = text.slice(6).split("|").map((s) => s.trim());
+    if (parts.length < 3) {
+      bot.sendMessage(
+        chatId,
+        "Usage: /send <to> | <subject> | <body>\n\nExample:\n/send john@example.com | Meeting tomorrow | Hi John, are you free at 3pm?"
+      );
+      return;
+    }
+    const [to, subject, body] = parts;
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        await sendEmail({ to, subject, body });
+        await bot.sendMessage(chatId, `✅ Email sent to *${to}*`, { parse_mode: "Markdown" });
+      } catch (err) {
+        await bot.sendMessage(chatId, gmailError(err));
+      }
+    });
+    return;
+  }
+
+  // /archive /trash /star /unstar /markread /markunread — email actions
+  const actionMap = {
+    "/archive":   "archive",
+    "/trash":     "trash",
+    "/star":      "star",
+    "/unstar":    "unstar",
+    "/markread":  "read",
+    "/markunread":"unread",
+  };
+
+  for (const [cmd, action] of Object.entries(actionMap)) {
+    if (text.startsWith(cmd + " ") || text === cmd) {
+      const arg = text.slice(cmd.length).trim() || "1";
+      enqueue(async () => {
+        bot.sendChatAction(chatId, "typing");
+        try {
+          const messageId = resolveEmailId(chatId, arg);
+          if (!messageId) {
+            await bot.sendMessage(chatId, `⚠️ Use /inbox first, then ${cmd} <number>`);
+            return;
+          }
+          await modifyEmail(messageId, action);
+          const labels = { archive: "Archived", trash: "Moved to trash", star: "Starred ⭐", unstar: "Unstarred", read: "Marked as read", unread: "Marked as unread" };
+          await bot.sendMessage(chatId, `✅ ${labels[action]}`);
+        } catch (err) {
+          await bot.sendMessage(chatId, gmailError(err));
+        }
+      });
+      return;
+    }
+  }
+
+  // /gmail — natural language Gmail action via LLM
+  if (text.startsWith("/gmail ")) {
+    const request = text.slice(7).trim();
+    enqueue(async () => {
+      bot.sendChatAction(chatId, "typing");
+      try {
+        const cached = emailCache.get(String(chatId)) ?? [];
+        const emailSummary = cached.length
+          ? cached.map((e, i) => `${i+1}. "${e.subject}" from ${e.from}`).join("\n")
+          : "No emails cached — user hasn\'t run /inbox yet";
+
+        const prompt = `You are controlling a Gmail bot. The user wants to: "${request}"
+
+Current cached emails:
+${emailSummary}
+
+Based on the request, reply with ONLY a JSON object:
+{
+  "action": "list"|"read"|"reply"|"send"|"archive"|"trash"|"star"|"unread",
+  "emailNumber": 1,
+  "to": "",
+  "subject": "",
+  "body": ""
+}
+
+Rules:
+- emailNumber = which email from the list (1-based)
+- For send/reply, fill in to/subject/body
+- If unclear, use action "list"
+- No explanation, just JSON`;
+
+        const raw    = await chat([{ role: "user", content: prompt }]);
+        const clean  = raw.replace(/\`\`\`json|\`\`\`/g, "").trim();
+        const intent = JSON.parse(clean);
+
+        // Execute the intent
+        if (intent.action === "list") {
+          const emails = await listEmails("is:unread in:inbox");
+          emailCache.set(String(chatId), emails);
+          await bot.sendMessage(chatId, formatEmailList(emails), { parse_mode: "Markdown" });
+
+        } else if (intent.action === "read") {
+          const messageId = resolveEmailId(chatId, String(intent.emailNumber));
+          if (!messageId) { await bot.sendMessage(chatId, "⚠️ Run /inbox first."); return; }
+          const email = await readEmail(messageId);
+          lastRead.set(String(chatId), { messageId, email });
+          await bot.sendMessage(chatId, formatEmailDetail(email), { parse_mode: "Markdown" });
+
+        } else if (intent.action === "reply") {
+          const messageId = resolveEmailId(chatId, String(intent.emailNumber));
+          if (!messageId) { await bot.sendMessage(chatId, "⚠️ Run /inbox first."); return; }
+          await replyToEmail(messageId, intent.body);
+          await bot.sendMessage(chatId, "✅ Reply sent!");
+
+        } else if (intent.action === "send") {
+          await sendEmail({ to: intent.to, subject: intent.subject, body: intent.body });
+          await bot.sendMessage(chatId, `✅ Email sent to *${intent.to}*`, { parse_mode: "Markdown" });
+
+        } else if (["archive","trash","star","unread","read"].includes(intent.action)) {
+          const messageId = resolveEmailId(chatId, String(intent.emailNumber));
+          if (!messageId) { await bot.sendMessage(chatId, "⚠️ Run /inbox first."); return; }
+          await modifyEmail(messageId, intent.action);
+          await bot.sendMessage(chatId, `✅ Done!`);
+        }
+
+      } catch (err) {
+        await bot.sendMessage(chatId, gmailError(err));
+      }
+    });
+    return;
+  }
+
   // ── /search <query> — explicit web search ─────────────────
   if (text.startsWith("/search ")) {
     const query = text.slice(8).trim();
@@ -351,21 +741,64 @@ bot.on("message", (msg) => {
     return;
   }
 
-  // ── Normal message — auto-search if enabled ────────────────
+  // ── Normal message — auto-search + memory ────────────────
   enqueue(async () => {
     bot.sendChatAction(chatId, "typing");
 
     try {
+      // ── Check for memory intent first ─────────────────────
+      const memIntent = detectMemoryIntent(text);
+
+      if (memIntent.type === "show") {
+        const mem = readMemory();
+        if (!mem) {
+          await bot.sendMessage(chatId, "🧠 Memory is empty. Tell me something to remember!");
+        } else {
+          for (const chunk of splitMessage(mem, 4000)) {
+            await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+          }
+        }
+        return;
+      }
+
+      if (memIntent.type === "remember") {
+        const { fact, section } = await extractFact(text, (h) => chat(h));
+        const line = appendMemory(fact, section);
+        await bot.sendMessage(chatId, `🧠 Got it! Saved to memory:\n${line}`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      if (memIntent.type === "forget") {
+        const query = text.replace(/^forget (that |this )?/i, "").trim();
+        const removed = forgetMemory(query);
+        await bot.sendMessage(chatId,
+          removed
+            ? `🗑️ Removed from memory: "${query}"`
+            : `Nothing in memory matched: "${query}"`
+        );
+        return;
+      }
+
+      // ── Normal LLM reply ──────────────────────────────────
       saveMessage(chatId, "user", text);
       const history = loadHistory(chatId);
       let augmented = history;
+
+      // Inject persistent memory into prompt context
+      const memCtx = buildMemoryContext();
+      if (memCtx) {
+        augmented = [
+          { role: "user",      content: memCtx },
+          { role: "assistant", content: "Understood, I have your memory context loaded." },
+          ...history,
+        ];
+      }
 
       // Auto web search: heuristic fast-path, then LLM confirm if ambiguous
       if (AUTO_SEARCH) {
         let needsSearch = likelyNeedsSearch(text);
         let searchQuery = text;
 
-        // If heuristic isn't confident, ask LLM (costs one small API call)
         if (!needsSearch) {
           const intent = await detectSearchIntent(text, (h) => chat(h));
           needsSearch  = intent.needed;
@@ -378,7 +811,7 @@ bot.on("message", (msg) => {
           try {
             const results = await search(searchQuery);
             const context = formatSearchResults(results, searchQuery);
-            augmented = injectContext(history, context);
+            augmented = injectContext(augmented, context);
           } catch (searchErr) {
             console.warn("Auto-search failed, answering without:", searchErr.message);
           }
@@ -388,6 +821,9 @@ bot.on("message", (msg) => {
       const reply = await chatWithRetry(augmented);
       saveMessage(chatId, "assistant", reply);
       await bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
+
+      // Auto-extract facts in background (non-blocking, silent)
+      autoExtractAndSave(text, reply, (h) => chat(h)).catch(() => {});
 
     } catch (err) {
       console.error("LLM error:", err.message);
@@ -401,6 +837,22 @@ bot.on("message", (msg) => {
     }
   });
 });
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+/** Split a long string into Telegram-safe chunks */
+function splitMessage(text, maxLen = 4000) {
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLen) {
+    const cut = remaining.lastIndexOf("\n", maxLen);
+    const pos  = cut > 0 ? cut : maxLen;
+    chunks.push(remaining.slice(0, pos));
+    remaining = remaining.slice(pos).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
 
 // ─── Graceful shutdown ─────────────────────────────────────────────────────
 
