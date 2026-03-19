@@ -489,25 +489,29 @@ bot.on("message", (msg) => {
 
   // ── /reminders — list pending reminders ───────────────────
   if (text === "/reminders") {
-    const pending = listPending(chatId);
-    await bot.sendMessage(chatId, formatReminderList(pending), { parse_mode: "Markdown" });
-    if (pending.length) {
-      await bot.sendMessage(chatId, "_Use /cancelreminder <number> to remove one_", { parse_mode: "Markdown" });
-    }
+    enqueue(async () => {
+      const pending = listPending(chatId);
+      await bot.sendMessage(chatId, formatReminderList(pending), { parse_mode: "Markdown" });
+      if (pending.length) {
+        await bot.sendMessage(chatId, "_Use /cancelreminder <number> to remove one_", { parse_mode: "Markdown" });
+      }
+    });
     return;
   }
 
   // ── /cancelreminder <n> ───────────────────────────────────
   if (text.startsWith("/cancelreminder ")) {
-    const n       = parseInt(text.slice(16).trim(), 10);
-    const pending = listPending(chatId);
-    const target  = pending[n - 1];
-    if (!target) {
-      await bot.sendMessage(chatId, "Reminder not found. Use /reminders to see the list.");
-      return;
-    }
-    deleteReminder(target.id, chatId);
-    await bot.sendMessage(chatId, `🗑️ Cancelled: *${target.message}*`, { parse_mode: "Markdown" });
+    enqueue(async () => {
+      const n       = parseInt(text.slice(16).trim(), 10);
+      const pending = listPending(chatId);
+      const target  = pending[n - 1];
+      if (!target) {
+        await bot.sendMessage(chatId, "Reminder not found. Use /reminders to see the list.");
+        return;
+      }
+      deleteReminder(target.id, chatId);
+      await bot.sendMessage(chatId, `🗑️ Cancelled: *${target.message}*`, { parse_mode: "Markdown" });
+    });
     return;
   }
 
