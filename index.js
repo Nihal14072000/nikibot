@@ -517,16 +517,17 @@ bot.on("message", (msg) => {
 
   // ── /memory — show current memory ───────────────────────────
   if (text === "/memory") {
-    const mem = readMemory();
-    if (!mem) {
-      bot.sendMessage(chatId, "Memory is empty. Say: remember that... to save something.");
-    } else {
-      // Split into chunks if too long for one Telegram message
-      const chunks = splitMessage(mem, 4000);
-      for (const chunk of chunks) {
-        await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+    enqueue(async () => {
+      const mem = readMemory();
+      if (!mem) {
+        bot.sendMessage(chatId, "Memory is empty. Say: remember that... to save something.");
+      } else {
+        const chunks = splitMessage(mem, 4000);
+        for (const chunk of chunks) {
+          await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+        }
       }
-    }
+    });
     return;
   }
 
@@ -547,19 +548,23 @@ bot.on("message", (msg) => {
   if (text.startsWith("/forget ")) {
     const query = text.slice(8).trim();
     if (!query) { bot.sendMessage(chatId, "Usage: /forget <what to forget>\nExample: /forget dark mode"); return; }
-    const removed = forgetMemory(query);
-    if (removed) {
-      await bot.sendMessage(chatId, `🗑️ Removed entries matching "*${query}*" from memory.`, { parse_mode: "Markdown" });
-    } else {
-      await bot.sendMessage(chatId, `Nothing in memory matched "*${query}*".`, { parse_mode: "Markdown" });
-    }
+    enqueue(async () => {
+      const removed = forgetMemory(query);
+      if (removed) {
+        await bot.sendMessage(chatId, `🗑️ Removed entries matching "*${query}*" from memory.`, { parse_mode: "Markdown" });
+      } else {
+        await bot.sendMessage(chatId, `Nothing in memory matched "*${query}*".`, { parse_mode: "Markdown" });
+      }
+    });
     return;
   }
 
   // ── /memoryclear — wipe entire memory ────────────────────
   if (text === "/memoryclear") {
-    replaceMemory("");
-    await bot.sendMessage(chatId, "🗑️ Memory cleared.");
+    enqueue(async () => {
+      replaceMemory("");
+      await bot.sendMessage(chatId, "🗑️ Memory cleared.");
+    });
     return;
   }
 
@@ -620,13 +625,15 @@ bot.on("message", (msg) => {
 
   // /gmailauth_reset — force re-authorisation
   if (text === "/gmailauth_reset") {
-    const TOKEN_PATH = path.resolve(process.env.GMAIL_TOKEN_PATH || "gmail-token.json");
-    if (fs.existsSync(TOKEN_PATH)) {
-      fs.unlinkSync(TOKEN_PATH);
-      await bot.sendMessage(chatId, "Token cleared. Send /gmailauth to reconnect.");
-    } else {
-      await bot.sendMessage(chatId, "No token found. Send /gmailauth to connect.");
-    }
+    enqueue(async () => {
+      const TOKEN_PATH = path.resolve(process.env.GMAIL_TOKEN_PATH || "gmail-token.json");
+      if (fs.existsSync(TOKEN_PATH)) {
+        fs.unlinkSync(TOKEN_PATH);
+        await bot.sendMessage(chatId, "Token cleared. Send /gmailauth to reconnect.");
+      } else {
+        await bot.sendMessage(chatId, "No token found. Send /gmailauth to connect.");
+      }
+    });
     return;
   }
 
@@ -636,7 +643,7 @@ bot.on("message", (msg) => {
     const session = gmailAuthSessions.get(String(chatId));
 
     if (!session) {
-      await bot.sendMessage(chatId, "No pending auth session. Send /gmailauth first.");
+      bot.sendMessage(chatId, "No pending auth session. Send /gmailauth first.");
       return;
     }
 
